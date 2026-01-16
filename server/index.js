@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import http from "node:http";
 import { mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -9,6 +10,7 @@ const webRoot = path.join(__dirname, "..", "web");
 const port = Number(process.env.SERVER_PORT || 8787);
 const dataDir = path.join(__dirname, "..", "data");
 const dbPath = process.env.GLUGG_DB || path.join(dataDir, "glugg.db");
+const sessionTtlMs = 1000 * 60 * 60 * 12;
 
 const contentTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -28,6 +30,16 @@ db.exec(`
     url TEXT NOT NULL,
     api_key TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )
 `);
@@ -61,6 +73,112 @@ function json(res, status, body) {
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
   });
   res.end(JSON.stringify(body));
+}
+
+const sessions = new Map();
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString("base64");
+}
+
+function verifyPassword(password, salt, storedHash) {
+  const computed = hashPassword(password, salt);
+  const stored = Buffer.from(storedHash, "base64");
+  const candidate = Buffer.from(computed, "base64");
+  if (stored.length !== candidate.length) return false;
+  return crypto.timingSafeEqual(stored, candidate);
+}
+
+function createUser(username, password, role) {
+  const salt = crypto.randomBytes(16).toString("base64");
+  const passwordHash = hashPassword(password, salt);
+  const stmt = db.prepare(
+    "INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)"
+  );
+  stmt.run(username, passwordHash, salt, role);
+}
+
+function getUserByUsername(username) {
+  return db
+    .prepare("SELECT id, username, password_hash, salt, role FROM users WHERE username = ?")
+    .get(username);
+}
+
+function getAllUsers() {
+  return db
+    .prepare("SELECT id, username, role, created_at FROM users ORDER BY id")
+    .all();
+}
+
+function userCount() {
+  const row = db.prepare("SELECT COUNT(*) AS count FROM users").get();
+  return row ? row.count : 0;
+}
+
+function adminCount() {
+  const row = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get();
+  return row ? row.count : 0;
+}
+
+function parseCookies(header) {
+  if (!header) return {};
+  return header.split(";").reduce((acc, part) => {
+    const [key, ...rest] = part.trim().split("=");
+    acc[key] = decodeURIComponent(rest.join("=") || "");
+    return acc;
+  }, {});
+}
+
+function getSession(req) {
+  const cookies = parseCookies(req.headers.cookie || "");
+  const token = cookies.glugg_session;
+  if (!token) return null;
+  const entry = sessions.get(token);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > sessionTtlMs) {
+    sessions.delete(token);
+    return null;
+  }
+  return entry;
+}
+
+function setSession(res, session) {
+  const token = crypto.randomUUID();
+  sessions.set(token, { ...session, createdAt: Date.now() });
+  res.setHeader(
+    "Set-Cookie",
+    `glugg_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax`
+  );
+}
+
+function clearSession(req, res) {
+  const cookies = parseCookies(req.headers.cookie || "");
+  if (cookies.glugg_session) {
+    sessions.delete(cookies.glugg_session);
+  }
+  res.setHeader(
+    "Set-Cookie",
+    "glugg_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
+  );
+}
+
+function requireAuth(req, res) {
+  const session = getSession(req);
+  if (!session) {
+    json(res, 401, { error: "Unauthorized" });
+    return null;
+  }
+  return session;
+}
+
+function requireAdmin(req, res) {
+  const session = requireAuth(req, res);
+  if (!session) return null;
+  if (session.role !== "admin") {
+    json(res, 403, { error: "Admin access required" });
+    return null;
+  }
+  return session;
 }
 
 function readJson(req) {
@@ -97,6 +215,12 @@ function normalizeServerInput(payload) {
     apiKey,
     enabled,
   };
+}
+
+function normalizeRole(role) {
+  const normalized = String(role || "").trim().toLowerCase();
+  if (normalized === "admin" || normalized === "user") return normalized;
+  return null;
 }
 
 function getServersFromEnv() {
@@ -241,14 +365,22 @@ function getQuality(item) {
   return null;
 }
 
-async function fetchItemsByIds(server, ids) {
+async function fetchItemsByIds(
+  server,
+  ids,
+  fields = "Name,ParentId,Type,CollectionType",
+  userId
+) {
   const unique = Array.from(new Set(ids)).filter(Boolean);
   if (!unique.length) return [];
   const params = new URLSearchParams({
     Ids: unique.join(","),
-    Fields: "Name,ParentId,Type,CollectionType",
+    Fields: fields,
   });
-  const url = `${getEmbyBase(server.url)}/Items?${params.toString()}`;
+  const base = userId
+    ? `${getEmbyBase(server.url)}/Users/${userId}/Items`
+    : `${getEmbyBase(server.url)}/Items`;
+  const url = `${base}?${params.toString()}`;
   const response = await fetch(url, {
     headers: {
       "X-Emby-Token": server.apiKey,
@@ -262,8 +394,54 @@ async function fetchItemsByIds(server, ids) {
   return Array.isArray(payload.Items) ? payload.Items : [];
 }
 
-async function fetchMediaFolders(server) {
-  const url = `${getEmbyBase(server.url)}/Library/MediaFolders`;
+const libraryCache = new Map();
+const libraryCacheTtlMs = 1000 * 60 * 5;
+const itemLibraryCache = new Map();
+const itemLibraryCacheTtlMs = 1000 * 60 * 30;
+
+async function fetchCurrentUserId(server) {
+  const url = `${getEmbyBase(server.url)}/Users/Me`;
+  const response = await fetch(url, {
+    headers: {
+      "X-Emby-Token": server.apiKey,
+      Accept: "application/json",
+    },
+  });
+  if (response.ok) {
+    const payload = await response.json();
+    return payload.Id || payload.id || null;
+  }
+  const fallback = await fetch(`${getEmbyBase(server.url)}/Users`, {
+    headers: {
+      "X-Emby-Token": server.apiKey,
+      Accept: "application/json",
+    },
+  });
+  if (!fallback.ok) return null;
+  const payload = await fallback.json();
+  const users = Array.isArray(payload) ? payload : payload.Items;
+  if (!Array.isArray(users) || !users.length) return null;
+  return users[0].Id || users[0].id || null;
+}
+
+async function fetchLibraryViews(server) {
+  const userId = await fetchCurrentUserId(server);
+  if (!userId) return { userId: null, views: [] };
+  const url = `${getEmbyBase(server.url)}/Users/${userId}/Views`;
+  const response = await fetch(url, {
+    headers: {
+      "X-Emby-Token": server.apiKey,
+      Accept: "application/json",
+    },
+  });
+  if (!response.ok) return { userId: null, views: [] };
+  const payload = await response.json();
+  const items = Array.isArray(payload.Items) ? payload.Items : [];
+  return { userId, views: items.map((item) => ({ id: item.Id, name: item.Name })) };
+}
+
+async function fetchLibraryFolders(server, endpoint) {
+  const url = `${getEmbyBase(server.url)}${endpoint}`;
   const response = await fetch(url, {
     headers: {
       "X-Emby-Token": server.apiKey,
@@ -274,24 +452,74 @@ async function fetchMediaFolders(server) {
     return [];
   }
   const payload = await response.json();
-  const folders = Array.isArray(payload.Items) ? payload.Items : [];
+  const items = Array.isArray(payload.Items) ? payload.Items : [];
   const entries = [];
-  folders.forEach((folder) => {
-    if (Array.isArray(folder.Paths)) {
-      folder.Paths.forEach((folderPath) => {
-        entries.push({ name: folder.Name, path: folderPath });
+  items.forEach((item) => {
+    if (Array.isArray(item.Paths)) {
+      item.Paths.forEach((folderPath) => {
+        entries.push({ name: item.Name, path: folderPath });
       });
       return;
     }
-    if (folder.Path) {
-      entries.push({ name: folder.Name, path: folder.Path });
+    if (Array.isArray(item.Locations)) {
+      item.Locations.forEach((folderPath) => {
+        entries.push({ name: item.Name, path: folderPath });
+      });
+      return;
+    }
+    if (item.Path) {
+      entries.push({ name: item.Name, path: item.Path });
     }
   });
   return entries.filter((entry) => entry.name && entry.path);
 }
 
-async function fetchAncestors(server, itemId) {
-  const url = `${getEmbyBase(server.url)}/Items/${itemId}/Ancestors`;
+async function getLibraryEntries(server) {
+  const cacheKey = server.url;
+  const cached = libraryCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < libraryCacheTtlMs) {
+    return cached;
+  }
+  const mediaFolders = await fetchLibraryFolders(server, "/Library/MediaFolders");
+  const virtualFolders = await fetchLibraryFolders(server, "/Library/VirtualFolders");
+  const { userId, views } = await fetchLibraryViews(server);
+  const viewItems = await fetchItemsByIds(
+    server,
+    views.map((view) => view.id),
+    "Name,Path,Locations"
+    ,
+    userId
+  );
+  const viewEntries = [];
+  viewItems.forEach((item) => {
+    if (Array.isArray(item.Locations)) {
+      item.Locations.forEach((folderPath) => {
+        viewEntries.push({ name: item.Name, path: folderPath });
+      });
+      return;
+    }
+    if (item.Path) {
+      viewEntries.push({ name: item.Name, path: item.Path });
+    }
+  });
+  const combined = [...mediaFolders, ...virtualFolders, ...viewEntries];
+  const seen = new Set();
+  const entries = combined.filter((entry) => {
+    const key = `${entry.name}:${entry.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const result = { fetchedAt: Date.now(), entries, views, userId };
+  libraryCache.set(cacheKey, result);
+  return result;
+}
+
+async function fetchAncestors(server, itemId, userId) {
+  const base = userId
+    ? `${getEmbyBase(server.url)}/Users/${userId}/Items/${itemId}/Ancestors`
+    : `${getEmbyBase(server.url)}/Items/${itemId}/Ancestors`;
+  const url = base;
   const response = await fetch(url, {
     headers: {
       "X-Emby-Token": server.apiKey,
@@ -320,45 +548,6 @@ function resolveLibraryByPath(itemPath, mediaFolders) {
   return match ? match.name : null;
 }
 
-function inferLibraryFromPath(itemPath) {
-  if (!itemPath) return null;
-  const normalized = itemPath.toLowerCase();
-  const tvMarkers = [
-    "/tv/",
-    "/tv 4k/",
-    "/tv4k/",
-    "/tv-4k/",
-    "/tv_4k/",
-    "/series/",
-    "/shows/",
-    "/television/",
-  ];
-  const movieMarkers = [
-    "/movies/",
-    "/movies 4k/",
-    "/movies4k/",
-    "/movies-4k/",
-    "/movies_4k/",
-    "/movie/",
-    "/movie-4k/",
-    "/movie_4k/",
-    "/films/",
-    "/film/",
-  ];
-  const isTv = tvMarkers.some((marker) => normalized.includes(marker));
-  const isMovie = movieMarkers.some((marker) => normalized.includes(marker));
-  const is4k =
-    normalized.includes("/4k/") ||
-    normalized.includes("/uhd/") ||
-    normalized.includes("2160") ||
-    normalized.includes("movies-4k") ||
-    normalized.includes("tv-4k") ||
-    normalized.includes("movies_4k") ||
-    normalized.includes("tv_4k");
-  if (!isTv && !isMovie) return null;
-  if (is4k) return isTv ? "TV 4K" : "Movies 4K";
-  return isTv ? "TV" : "Movies";
-}
 
 function inferQualityFromPath(itemPath) {
   if (!itemPath) return null;
@@ -392,7 +581,7 @@ function qualityRank(quality) {
   }
 }
 
-async function fetchSeriesQuality(server, seriesId) {
+async function fetchSeriesQuality(server, seriesId, userId) {
   const params = new URLSearchParams({
     ParentId: seriesId,
     IncludeItemTypes: "Episode",
@@ -400,7 +589,10 @@ async function fetchSeriesQuality(server, seriesId) {
     Limit: "1",
     Fields: "MediaStreams,Path",
   });
-  const url = `${getEmbyBase(server.url)}/Items?${params.toString()}`;
+  const base = userId
+    ? `${getEmbyBase(server.url)}/Users/${userId}/Items`
+    : `${getEmbyBase(server.url)}/Items`;
+  const url = `${base}?${params.toString()}`;
   const response = await fetch(url, {
     headers: {
       "X-Emby-Token": server.apiKey,
@@ -416,7 +608,7 @@ async function fetchSeriesQuality(server, seriesId) {
   return getQuality(item) || inferQualityFromPath(item.Path);
 }
 
-async function resolveLibraries(server, items, mediaFolders) {
+async function resolveLibraries(server, items, mediaFolders, viewMap, userId) {
   if (!items.length) return new Map();
   const idToItem = new Map();
   const itemToRoot = new Map();
@@ -434,7 +626,7 @@ async function resolveLibraries(server, items, mediaFolders) {
   let current = new Set(pending);
   while (current.size && depth < 4) {
     const batch = Array.from(current);
-    const fetched = await fetchItemsByIds(server, batch);
+    const fetched = await fetchItemsByIds(server, batch, "Name,ParentId,Type,CollectionType", userId);
     fetched.forEach((node) => {
       idToItem.set(node.Id, node);
     });
@@ -454,12 +646,20 @@ async function resolveLibraries(server, items, mediaFolders) {
 
   const libraryMap = new Map();
   itemToRoot.forEach((rootId, itemId) => {
+    if (viewMap && viewMap.has(rootId)) {
+      libraryMap.set(itemId, viewMap.get(rootId));
+      return;
+    }
     let currentId = rootId;
     let hops = 0;
     let libraryName = null;
     while (currentId && hops < 5) {
       const node = idToItem.get(currentId);
       if (!node) break;
+      if (viewMap && node.ParentId && viewMap.has(node.ParentId)) {
+        libraryName = viewMap.get(node.ParentId);
+        break;
+      }
       const name = (node.Name || "").trim();
       const isLibrary = node.Type === "CollectionFolder" || node.CollectionType;
       if (isLibrary && name && name.toLowerCase() !== "root") {
@@ -482,19 +682,16 @@ async function resolveLibraries(server, items, mediaFolders) {
     });
   }
 
-  items.forEach((item) => {
-    if (libraryMap.get(item.Id)) return;
-    const inferred = inferLibraryFromPath(item.Path);
-    if (inferred) {
-      libraryMap.set(item.Id, inferred);
-    }
-  });
-
   const unresolved = items.filter((item) => !libraryMap.get(item.Id));
   if (unresolved.length) {
     await Promise.all(
       unresolved.map(async (item) => {
-        const ancestors = await fetchAncestors(server, item.Id);
+        const ancestors = await fetchAncestors(server, item.Id, userId);
+        const viewAncestor = ancestors.find((ancestor) => viewMap && viewMap.has(ancestor.Id));
+        if (viewAncestor) {
+          libraryMap.set(item.Id, viewMap.get(viewAncestor.Id));
+          return;
+        }
         const library = ancestors.find(
           (ancestor) =>
             (ancestor.Type === "CollectionFolder" || ancestor.CollectionType) &&
@@ -503,6 +700,53 @@ async function resolveLibraries(server, items, mediaFolders) {
         );
         if (library) {
           libraryMap.set(item.Id, library.Name);
+        }
+      })
+    );
+  }
+
+  const stillUnresolved = items.filter((item) => !libraryMap.get(item.Id));
+  if (stillUnresolved.length && viewMap && viewMap.size) {
+    const viewIds = Array.from(viewMap.keys());
+    await Promise.all(
+      stillUnresolved.map(async (item) => {
+        const cacheKey = `${server.url}:${item.Id}`;
+        const cached = itemLibraryCache.get(cacheKey);
+        if (cached && Date.now() - cached.fetchedAt < itemLibraryCacheTtlMs) {
+          libraryMap.set(item.Id, cached.name);
+          return;
+        }
+        if (!item.ParentId) return;
+        const parentHits = new Map();
+        await Promise.all(
+          viewIds.map(async (viewId) => {
+            const params = new URLSearchParams({
+              ParentId: viewId,
+              Recursive: "true",
+              IncludeItemTypes: item.Type || "",
+              Limit: "1",
+              Fields: "Id",
+              Ids: item.Id,
+            });
+            const url = `${getEmbyBase(server.url)}/Users/${userId}/Items?${params.toString()}`;
+            const response = await fetch(url, {
+              headers: {
+                "X-Emby-Token": server.apiKey,
+                Accept: "application/json",
+              },
+            });
+            if (!response.ok) return;
+            const payload = await response.json();
+            const items = Array.isArray(payload.Items) ? payload.Items : [];
+            if (items.find((entry) => entry.Id === item.Id)) {
+              parentHits.set(item.Id, viewMap.get(viewId));
+            }
+          })
+        );
+        if (parentHits.has(item.Id)) {
+          const libraryName = parentHits.get(item.Id);
+          libraryMap.set(item.Id, libraryName);
+          itemLibraryCache.set(cacheKey, { name: libraryName, fetchedAt: Date.now() });
         }
       })
     );
@@ -542,8 +786,9 @@ async function searchServer(server, query, type) {
     }
     return true;
   });
-  const mediaFolders = await fetchMediaFolders(server);
-  const libraryMap = await resolveLibraries(server, filtered, mediaFolders);
+  const { entries: mediaFolders, views, userId } = await getLibraryEntries(server);
+  const viewMap = new Map(views.map((view) => [view.id, view.name]));
+  const libraryMap = await resolveLibraries(server, filtered, mediaFolders, viewMap, userId);
   return Promise.all(
     filtered.map(async (item) => {
       let quality = (() => {
@@ -554,7 +799,7 @@ async function searchServer(server, query, type) {
         return qualityRank(fromPath) >= qualityRank(fromStream) ? fromPath : fromStream;
       })();
       if (!quality && item.Type === "Series") {
-        quality = await fetchSeriesQuality(server, item.Id);
+        quality = await fetchSeriesQuality(server, item.Id, userId);
       }
       return {
         id: item.Id,
@@ -566,6 +811,8 @@ async function searchServer(server, query, type) {
         library: libraryMap.get(item.Id) || null,
         quality,
         path: item.Path || null,
+        topParentId: item.TopParentId || null,
+        parentId: item.ParentId || null,
       };
     })
   );
@@ -610,7 +857,192 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/me") {
+    const session = getSession(req);
+    json(res, 200, {
+      authenticated: Boolean(session),
+      role: session ? session.role : null,
+      username: session ? session.username : null,
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/setup/status") {
+    const needsSetup = userCount() === 0;
+    json(res, 200, { needsSetup });
+    return;
+  }
+
+  if (url.pathname === "/api/setup" && req.method === "POST") {
+    if (userCount() > 0) {
+      json(res, 409, { error: "Setup already completed" });
+      return;
+    }
+    try {
+      const payload = await readJson(req);
+      const username = String(payload.username || "").trim();
+      const password = String(payload.password || "");
+      if (!username || !password) {
+        json(res, 400, { error: "Missing username or password" });
+        return;
+      }
+      createUser(username, password, "admin");
+      json(res, 201, { ok: true });
+      return;
+    } catch {
+      json(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/login" && req.method === "POST") {
+    if (userCount() === 0) {
+      json(res, 409, { error: "Setup required" });
+      return;
+    }
+    try {
+      const payload = await readJson(req);
+      const username = String(payload.username || "").trim();
+      const password = String(payload.password || "").trim();
+      const user = getUserByUsername(username);
+      if (!user || !verifyPassword(password, user.salt, user.password_hash)) {
+        json(res, 401, { error: "Invalid credentials" });
+        return;
+      }
+      setSession(res, { username: user.username, role: user.role });
+      json(res, 200, { ok: true, role: user.role });
+      return;
+    } catch {
+      json(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/logout" && req.method === "POST") {
+    clearSession(req, res);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === "/api/users") {
+    const session = requireAdmin(req, res);
+    if (!session) return;
+    if (req.method === "GET") {
+      json(res, 200, { users: getAllUsers() });
+      return;
+    }
+    if (req.method === "POST") {
+      try {
+        const payload = await readJson(req);
+        const username = String(payload.username || "").trim();
+        const password = String(payload.password || "");
+        const role = normalizeRole(payload.role);
+        if (!username || !password || !role) {
+          json(res, 400, { error: "Missing username, password, or role" });
+          return;
+        }
+        if (getUserByUsername(username)) {
+          json(res, 409, { error: "Username already exists" });
+          return;
+        }
+        createUser(username, password, role);
+        json(res, 201, { ok: true });
+      } catch {
+        json(res, 400, { error: "Invalid JSON body" });
+      }
+      return;
+    }
+    json(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/users/")) {
+    const session = requireAdmin(req, res);
+    if (!session) return;
+    const id = Number(url.pathname.split("/").pop());
+    if (!Number.isFinite(id)) {
+      json(res, 400, { error: "Invalid user id" });
+      return;
+    }
+    if (req.method === "PUT") {
+      try {
+        const payload = await readJson(req);
+        const username = String(payload.username || "").trim();
+        const password = String(payload.password || "");
+        const role = normalizeRole(payload.role);
+        const existing = db
+          .prepare("SELECT id, username, role FROM users WHERE id = ?")
+          .get(id);
+        if (!existing) {
+          json(res, 404, { error: "User not found" });
+          return;
+        }
+        if (!username || !role) {
+          json(res, 400, { error: "Missing username or role" });
+          return;
+        }
+        if (role !== existing.role && existing.role === "admin" && adminCount() === 1) {
+          json(res, 409, { error: "At least one admin is required" });
+          return;
+        }
+        if (username !== existing.username && getUserByUsername(username)) {
+          json(res, 409, { error: "Username already exists" });
+          return;
+        }
+        db.exec("BEGIN");
+        try {
+          db.prepare("UPDATE users SET username = ?, role = ? WHERE id = ?").run(
+            username,
+            role,
+            id
+          );
+          if (password) {
+            const salt = crypto.randomBytes(16).toString("base64");
+            const passwordHash = hashPassword(password, salt);
+            db.prepare("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?").run(
+              passwordHash,
+              salt,
+              id
+            );
+          }
+          db.exec("COMMIT");
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+        json(res, 200, { ok: true });
+      } catch (error) {
+        json(res, 400, { error: error instanceof Error ? error.message : "Invalid JSON body" });
+      }
+      return;
+    }
+    if (req.method === "DELETE") {
+      const existing = db
+        .prepare("SELECT id, username, role FROM users WHERE id = ?")
+        .get(id);
+      if (!existing) {
+        json(res, 404, { error: "User not found" });
+        return;
+      }
+      if (existing.role === "admin" && adminCount() === 1) {
+        json(res, 409, { error: "At least one admin is required" });
+        return;
+      }
+      if (existing.username === session.username && existing.role === "admin") {
+        json(res, 409, { error: "Cannot delete the active admin session" });
+        return;
+      }
+      db.prepare("DELETE FROM users WHERE id = ?").run(id);
+      json(res, 200, { ok: true });
+      return;
+    }
+    json(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
   if (url.pathname === "/api/servers") {
+    const session = requireAdmin(req, res);
+    if (!session) return;
     if (req.method === "GET") {
       json(res, 200, { servers: getAllServersFromDb() });
       return;
@@ -649,6 +1081,8 @@ const server = http.createServer(async (req, res) => {
       json(res, 400, { error: "Invalid server id" });
       return;
     }
+    const session = requireAdmin(req, res);
+    if (!session) return;
     if (parts.length === 4 && parts[3] === "debug") {
       if (req.method !== "GET") {
         json(res, 405, { error: "Method not allowed" });
@@ -673,15 +1107,14 @@ const server = http.createServer(async (req, res) => {
           query,
           type
         );
-        const mediaFolders = await fetchMediaFolders({
-          url: row.url,
-          apiKey: row.api_key,
-        });
+        const serverInfo = { url: row.url, apiKey: row.api_key };
+        const { entries: mediaFolders, views, userId } = await getLibraryEntries(serverInfo);
         const debug = await Promise.all(
           items.map(async (item) => {
             const ancestors = await fetchAncestors(
-              { url: row.url, apiKey: row.api_key },
-              item.id
+              serverInfo,
+              item.id,
+              userId
             );
             return {
               id: item.id,
@@ -691,6 +1124,8 @@ const server = http.createServer(async (req, res) => {
               library: item.library,
               quality: item.quality,
               path: item.path || null,
+              topParentId: item.topParentId || null,
+              parentId: item.parentId || null,
               ancestors: ancestors.map((ancestor) => ({
                 id: ancestor.Id,
                 name: ancestor.Name,
@@ -700,7 +1135,7 @@ const server = http.createServer(async (req, res) => {
             };
           })
         );
-        json(res, 200, { server: row.name, mediaFolders, items: debug });
+        json(res, 200, { server: row.name, mediaFolders, views, items: debug });
       } catch (error) {
         json(res, 500, { error: error instanceof Error ? error.message : "Debug failed" });
       }
@@ -788,6 +1223,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/search") {
+    const session = requireAuth(req, res);
+    if (!session) return;
     const query = url.searchParams.get("q");
     const type = url.searchParams.get("type") || "all";
     if (!query) {
