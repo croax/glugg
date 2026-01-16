@@ -14,6 +14,27 @@ npm run dev
 
 3. Open `http://localhost:8787`, complete setup, and log in.
 
+## Docker
+
+Build and run with Docker:
+
+```sh
+docker build -t glugg .
+docker run --rm -p 8787:8787 \
+  -e SERVER_PORT=8787 \
+  -e GLUGG_DB=/app/data/glugg.db \
+  -v glugg-data:/app/data \
+  glugg
+```
+
+Or use docker compose:
+
+```sh
+docker compose up --build
+```
+
+To seed servers on first run, pass `EMBY_SERVERS` as JSON in the environment (see `.env` format).
+
 ## Configuration
 
 ### SQLite (preferred)
