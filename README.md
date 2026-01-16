@@ -1,24 +1,25 @@
 # Glugg
 
-Glugg is a tiny search UI that queries multiple Emby servers and shows where a title is available.
+Glugg is a search UI that queries multiple Emby servers and shows where a title is available.
 The Node server proxies Emby servers stored in SQLite (with `.env` as a fallback).
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` and add your Emby server list.
+1. Copy `.env.example` to `.env`.
 2. Run the server:
 
 ```sh
 npm run dev
 ```
 
-3. Open `http://localhost:8787`.
+3. Open `http://localhost:8787`, complete setup, and log in.
 
 ## Configuration
 
 ### SQLite (preferred)
 
-Servers are stored in `data/glugg.db` by default. Use the config API:
+Servers are stored in `data/glugg.db` by default. Admins can manage servers from the Settings tab.
+The config API is still available:
 
 ```sh
 curl -X POST http://localhost:8787/api/servers \
@@ -41,15 +42,56 @@ EMBY_SERVERS=[{"name":"Living Room","url":"http://emby.local:8096","apiKey":"REP
 ## Authentication
 
 - On first launch, create the initial admin user in the in-app setup flow.
-- Admins can access the Settings tab and manage servers.
+- Admins can access the Settings tab and manage servers and users.
 - Standard users can search but cannot access Settings.
- - Admins can manage users in the Settings tab.
+
+### User management
+
+- Admins can create, edit, and delete users in Settings.
+- Password updates are optional when editing users.
 
 ## Onboarding
 
 1. Start the app and open the UI.
 2. Create the first admin account when prompted.
-3. Log in and add servers in Settings.
+3. Log in, add servers in Settings, and optionally create standard users.
+
+## API Endpoints
+
+Auth:
+- `GET /api/me`
+- `POST /api/login`
+- `POST /api/logout`
+- `GET /api/setup/status`
+- `POST /api/setup`
+
+Search:
+- `GET /api/search?q=...&type=all|movie|series`
+
+Servers (admin):
+- `GET /api/servers`
+- `POST /api/servers`
+- `PUT /api/servers/:id`
+- `DELETE /api/servers/:id`
+- `POST /api/servers/:id/test`
+- `GET /api/servers/:id/debug?q=...&type=all|movie|series`
+
+Users (admin):
+- `GET /api/users`
+- `POST /api/users`
+- `PUT /api/users/:id`
+- `DELETE /api/users/:id`
+
+## Deployment Notes
+
+- Run behind a reverse proxy (nginx, Caddy) for HTTPS.
+- Set a fixed `SERVER_PORT` and forward to it.
+- Sessions are in-memory; restart invalidates logins.
+- Store `data/glugg.db` on persistent storage.
+
+## Versioning
+
+This project uses Semantic Versioning (SemVer). Pre-release builds follow `X.Y.Z-alpha.N`.
 
 ## Notes
 
