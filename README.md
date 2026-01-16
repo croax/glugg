@@ -34,8 +34,22 @@ Once a server is saved, it appears in the in-app Servers panel for editing.
 
 ```
 SERVER_PORT=8787
+GLUGG_DB=./data/glugg.db
 EMBY_SERVERS=[{"name":"Living Room","url":"http://emby.local:8096","apiKey":"REPLACE_ME"}]
 ```
+
+## Authentication
+
+- On first launch, create the initial admin user in the in-app setup flow.
+- Admins can access the Settings tab and manage servers.
+- Standard users can search but cannot access Settings.
+ - Admins can manage users in the Settings tab.
+
+## Onboarding
+
+1. Start the app and open the UI.
+2. Create the first admin account when prompted.
+3. Log in and add servers in Settings.
 
 ## Notes
 

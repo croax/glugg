@@ -7,9 +7,22 @@ const serversStatus = document.getElementById("servers-status");
 const tabSearch = document.getElementById("tab-search");
 const tabSettings = document.getElementById("tab-settings");
 const serversPanel = document.getElementById("servers-panel");
+const usersPanel = document.getElementById("users-panel");
 const resultsPanel = document.getElementById("results-panel");
+const tabs = document.getElementById("tabs");
+const loginForm = document.getElementById("login-form");
+const logoutButton = document.getElementById("logout-button");
+const authStatus = document.getElementById("auth-status");
+const setupPanel = document.getElementById("setup-panel");
+const setupForm = document.getElementById("setup-form");
+const setupStatus = document.getElementById("setup-status");
+const userList = document.getElementById("user-list");
+const addUserButton = document.getElementById("add-user");
+const usersStatus = document.getElementById("users-status");
 
 let servers = [];
+let currentRole = null;
+let users = [];
 
 async function searchProxy(query, type) {
   const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&type=${type}`);
@@ -20,6 +33,45 @@ async function searchProxy(query, type) {
   return response.json();
 }
 
+async function fetchSession() {
+  const response = await fetch("/api/me");
+  return response.json();
+}
+
+async function fetchSetupStatus() {
+  const response = await fetch("/api/setup/status");
+  return response.json();
+}
+
+async function setupAdmin(username, password) {
+  const response = await fetch("/api/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || "Setup failed");
+  }
+}
+
+async function login(username, password) {
+  const response = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || "Login failed");
+  }
+  return response.json();
+}
+
+async function logout() {
+  await fetch("/api/logout", { method: "POST" });
+}
+
 async function fetchServers() {
   const response = await fetch("/api/servers");
   if (!response.ok) {
@@ -27,6 +79,53 @@ async function fetchServers() {
   }
   const payload = await response.json();
   return Array.isArray(payload.servers) ? payload.servers : [];
+}
+
+async function fetchUsers() {
+  const response = await fetch("/api/users");
+  if (!response.ok) {
+    throw new Error("Failed to load users");
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.users) ? payload.users : [];
+}
+
+async function saveUser(user) {
+  const payload = {
+    username: user.username,
+    role: user.role,
+    password: user.password || "",
+  };
+  if (user.id) {
+    const response = await fetch(`/api/users/${user.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || "Failed to update user");
+    }
+    return;
+  }
+  const response = await fetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || "Failed to create user");
+  }
+}
+
+async function deleteUser(user) {
+  if (!user.id) return;
+  const response = await fetch(`/api/users/${user.id}`, { method: "DELETE" });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || "Failed to delete user");
+  }
 }
 
 async function saveServer(server) {
@@ -147,7 +246,7 @@ function createServerCard(server, index) {
   const testButton = document.createElement("button");
   testButton.type = "button";
   testButton.className = "secondary";
-  testButton.textContent = "Test connection";
+  testButton.textContent = "Test";
   testButton.addEventListener("click", async () => {
     if (!servers[index].id) {
       status.textContent = "Save the server before testing.";
@@ -191,8 +290,41 @@ function setActiveTab(tab) {
   tabSearch.classList.toggle("active", !isSettings);
   tabSettings.classList.toggle("active", isSettings);
   serversPanel.hidden = !isSettings;
+  usersPanel.hidden = !isSettings;
   form.hidden = isSettings;
   resultsPanel.hidden = isSettings;
+}
+
+function setAuthState(session) {
+  const authenticated = session && session.authenticated;
+  currentRole = authenticated ? session.role : null;
+  loginForm.hidden = authenticated;
+  logoutButton.hidden = !authenticated;
+  authStatus.textContent = authenticated
+    ? `Signed in as ${session.username} (${session.role}).`
+    : "Not signed in.";
+  tabs.hidden = !authenticated;
+  tabSearch.hidden = !authenticated;
+  tabSettings.hidden = !authenticated || currentRole !== "admin";
+  if (!authenticated) {
+    form.hidden = true;
+    resultsPanel.hidden = true;
+    serversPanel.hidden = true;
+    usersPanel.hidden = true;
+    return;
+  }
+  setActiveTab("search");
+}
+
+function showSetup() {
+  setupPanel.hidden = false;
+  loginForm.hidden = true;
+  logoutButton.hidden = true;
+  tabs.hidden = true;
+  form.hidden = true;
+  resultsPanel.hidden = true;
+  serversPanel.hidden = true;
+  authStatus.textContent = "Setup required.";
 }
 
 async function refreshServers() {
@@ -202,6 +334,98 @@ async function refreshServers() {
     renderServers();
   } catch (error) {
     serversStatus.textContent = error instanceof Error ? error.message : "Failed to load servers.";
+  }
+}
+
+function createUserCard(user, index) {
+  const card = document.createElement("div");
+  card.className = "user-card";
+
+  const usernameInput = document.createElement("input");
+  usernameInput.placeholder = "Username";
+  usernameInput.value = user.username || "";
+  usernameInput.addEventListener("input", (event) => {
+    users[index].username = event.target.value;
+  });
+
+  const roleSelect = document.createElement("select");
+  ["user", "admin"].forEach((role) => {
+    const option = document.createElement("option");
+    option.value = role;
+    option.textContent = role;
+    roleSelect.appendChild(option);
+  });
+  roleSelect.value = user.role || "user";
+  roleSelect.addEventListener("change", (event) => {
+    users[index].role = event.target.value;
+  });
+
+  const passwordInput = document.createElement("input");
+  passwordInput.placeholder = user.id ? "New password (leave blank)" : "Password";
+  passwordInput.type = "password";
+  passwordInput.value = "";
+  passwordInput.addEventListener("input", (event) => {
+    users[index].password = event.target.value;
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "user-actions";
+
+  const saveButton = document.createElement("button");
+  saveButton.type = "button";
+  saveButton.textContent = user.id ? "Save" : "Create";
+  saveButton.addEventListener("click", async () => {
+    usersStatus.textContent = "Saving user...";
+    try {
+      await saveUser(users[index]);
+      usersStatus.textContent = "User saved.";
+      await refreshUsers();
+    } catch (error) {
+      usersStatus.textContent = error instanceof Error ? error.message : "Save failed.";
+    }
+  });
+
+  const removeButton = document.createElement("button");
+  removeButton.type = "button";
+  removeButton.className = "secondary";
+  removeButton.textContent = "Remove";
+  removeButton.addEventListener("click", async () => {
+    usersStatus.textContent = "Removing user...";
+    try {
+      await deleteUser(users[index]);
+      usersStatus.textContent = "User removed.";
+      await refreshUsers();
+    } catch (error) {
+      usersStatus.textContent = error instanceof Error ? error.message : "Remove failed.";
+    }
+  });
+
+  actions.append(saveButton, removeButton);
+  card.append(usernameInput, roleSelect, passwordInput, actions);
+  return card;
+}
+
+function renderUsers() {
+  userList.innerHTML = "";
+  if (!users.length) {
+    const empty = document.createElement("p");
+    empty.className = "users-empty";
+    empty.textContent = "No users configured yet.";
+    userList.appendChild(empty);
+    return;
+  }
+  users.forEach((user, index) => {
+    userList.appendChild(createUserCard({ ...user }, index));
+  });
+}
+
+async function refreshUsers() {
+  try {
+    users = await fetchUsers();
+    usersStatus.textContent = users.length ? "Users loaded." : "No users configured yet.";
+    renderUsers();
+  } catch (error) {
+    usersStatus.textContent = error instanceof Error ? error.message : "Failed to load users.";
   }
 }
 
@@ -247,11 +471,12 @@ function renderResults(payload) {
       const row = document.createElement("tr");
       row.className = "result-row";
       const year = item.year ? `${item.year}` : "—";
-      const quality = item.quality || "—";
+      const quality = item.quality || "Unknown";
       const rating = typeof item.rating === "number" ? item.rating.toFixed(1) : "—";
+      const library = item.library || "Unknown";
       row.innerHTML = `
         <td>${result.server.name}</td>
-        <td>${item.library || "—"}</td>
+        <td>${library}</td>
         <td>${item.name}</td>
         <td>${year}</td>
         <td>${quality}</td>
@@ -287,11 +512,74 @@ addServerButton.addEventListener("click", () => {
   renderServers();
 });
 
+addUserButton.addEventListener("click", () => {
+  users.push({ username: "", role: "user", password: "" });
+  usersStatus.textContent = "New user added. Fill details and save.";
+  renderUsers();
+});
+
 tabSearch.addEventListener("click", () => setActiveTab("search"));
 tabSettings.addEventListener("click", () => {
   setActiveTab("settings");
   refreshServers();
+  refreshUsers();
 });
 
-refreshServers();
-setActiveTab("search");
+loginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const formData = new FormData(loginForm);
+  const username = String(formData.get("username") || "").trim();
+  const password = String(formData.get("password") || "");
+  authStatus.textContent = "Signing in...";
+  try {
+    await login(username, password);
+    const session = await fetchSession();
+    setAuthState(session);
+    resultsMeta.textContent = "Ready to search.";
+  } catch (error) {
+    authStatus.textContent = error instanceof Error ? error.message : "Login failed.";
+  }
+});
+
+logoutButton.addEventListener("click", async () => {
+  await logout();
+  const session = await fetchSession();
+  setAuthState(session);
+});
+
+(async () => {
+  const setup = await fetchSetupStatus();
+  if (setup.needsSetup) {
+    showSetup();
+    return;
+  }
+  setupPanel.hidden = true;
+  const session = await fetchSession();
+  setAuthState(session);
+  if (session && session.authenticated && session.role === "admin") {
+    refreshServers();
+    refreshUsers();
+  }
+})();
+
+setupForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const formData = new FormData(setupForm);
+  const username = String(formData.get("username") || "").trim();
+  const password = String(formData.get("password") || "");
+  const confirm = String(formData.get("confirm") || "");
+  if (password !== confirm) {
+    setupStatus.textContent = "Passwords do not match.";
+    return;
+  }
+  setupStatus.textContent = "Creating admin...";
+  try {
+    await setupAdmin(username, password);
+    setupStatus.textContent = "Admin created. Please log in.";
+    setupPanel.hidden = true;
+    loginForm.hidden = false;
+    authStatus.textContent = "Not signed in.";
+  } catch (error) {
+    setupStatus.textContent = error instanceof Error ? error.message : "Setup failed.";
+  }
+});
