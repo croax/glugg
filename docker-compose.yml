@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  glugg:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      SERVER_PORT: 8787
+      GLUGG_DB: /app/data/glugg.db
+      # EMBY_SERVERS: '[{"name":"Living Room","url":"http://emby.local:8096","apiKey":"REPLACE_ME"}]'
+    volumes:
+      - glugg-data:/app/data
+
+volumes:
+  glugg-data:
